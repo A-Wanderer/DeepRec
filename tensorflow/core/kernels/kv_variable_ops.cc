@@ -366,6 +366,8 @@ class KvResourceGatherOp : public OpKernel {
         return 1;
       };
     }
+    debug_record_time_ = 0;
+    debug_all_cost_ = 0;
   }
 
   void Compute(OpKernelContext* c) override {
@@ -406,6 +408,7 @@ class KvResourceGatherOp : public OpKernel {
       const size_t slice_bytes = slice_elems * sizeof(TValue);
       auto do_work = [this, indices_flat,
            out_base, slice_elems, c, default_v, ev, counts] (int64 start, int64 limit) {
+        if(start == 0) record_.SetStart();
         for (int64 i = start; i < limit; ++i) {
           TValue* default_v_ptr = get_default_v_fn_(default_v, indices_flat(i),
                                                     i, ev->GetDefaultValueDim(),
@@ -414,11 +417,14 @@ class KvResourceGatherOp : public OpKernel {
           ev->LookupOrCreate(indices_flat(i),
               out_base + i * slice_elems, default_v_ptr, count);
         }
+        if(start == 0) record_.UnitUpdate(limit - start);
       };
       auto worker_threads = c->device()->tensorflow_cpu_worker_threads();
       Shard(worker_threads->num_threads, worker_threads->workers, indices_size,
           slice_bytes, do_work);
-          
+      //TestShard(debug_record_time_, debug_all_cost_, worker_threads->num_threads, worker_threads->workers, indices_size,
+          //slice_bytes, do_work);
+          //slice_bytes, do_work, &record_);
       ev->storage_manager()->Schedule([ev, indices_flat, indices_size]() {
         embedding::BatchCache<TKey>* cache = ev->Cache();
         if (cache) {
@@ -432,6 +438,9 @@ class KvResourceGatherOp : public OpKernel {
     bool is_use_default_value_tensor_;
     std::function<TValue*(TValue*, TKey, int64, int64, int64)> get_default_v_fn_;
     std::function<int32(int32*, int64)> get_count_fn_;
+    CostRecorder record_;
+    int64 debug_record_time_;
+    int64 debug_all_cost_;
 };
 
 #define REGISTER_GATHER_FULL(dev, ktype, vtype)                   \

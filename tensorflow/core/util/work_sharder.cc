@@ -29,8 +29,21 @@ void SetPerThreadMaxParallelism(int max_parallelism) {
 
 int GetPerThreadMaxParallelism() { return per_thread_max_parallism; }
 
+inline int GetIntEnvVarOrZero(const char* name) {
+  const char* val = getenv(name);
+  if (!val) {
+    return 0;
+  }
+  int res = std::stoi(val);
+  LOG(INFO) << res;
+  return res;
+}
+
 void Shard(int max_parallelism, thread::ThreadPool* workers, int64 total,
-           int64 cost_per_unit, std::function<void(int64, int64)> work) {
+           int64 cost_per_unit, std::function<void(int64, int64)> work, CostRecorder* recorder) {
+  // if recorder is nullptr, we use cost_per_unit as cost
+  // if recorder is not nullptr, we use recorder as cost
+  if (recorder) cost_per_unit = recorder->GetCost();
   CHECK_GE(total, 0);
   if (total == 0) {
     return;
@@ -42,6 +55,7 @@ void Shard(int max_parallelism, thread::ThreadPool* workers, int64 total,
     return;
   }
   if (max_parallelism >= workers->NumThreads()) {
+    if (recorder) cost_per_unit = recorder->GetEigenPoolCost();
     workers->ParallelFor(total, cost_per_unit, work);
     return;
   }
@@ -61,7 +75,7 @@ void Sharder::Do(int64 total, int64 cost_per_unit, const Work& work,
   // If total * cost_per_unit is small, it is not worth shard too
   // much. Let us assume each cost unit is 1ns, kMinCostPerShard=10000
   // is 10us.
-  static const int64 kMinCostPerShard = 10000;
+  static const int64 kMinCostPerShard = GetIntEnvVarOrZero("MIN_COST_PER");
   const int num_shards =
       std::max<int>(1, std::min(static_cast<int64>(max_parallelism),
                                 total * cost_per_unit / kMinCostPerShard));
@@ -91,6 +105,112 @@ void Sharder::Do(int64 total, int64 cost_per_unit, const Work& work,
   // Inline execute the 1st shard.
   work(0, std::min(block_size, total));
   counter.Wait();
+}
+
+void TestShard(int64& times, int64& all_cost, int max_parallelism, thread::ThreadPool* workers, int64 total,
+           int64 cost_per_unit, std::function<void(int64, int64)> work, CostRecorder* recorder) {
+  static int STATIC_COST = GetIntEnvVarOrZero("STATIC_COST");
+  auto start_time = std::chrono::high_resolution_clock::now();
+  if (STATIC_COST != 0 || recorder == nullptr)
+    Shard(max_parallelism,
+          workers, total,
+          cost_per_unit, work);
+  else
+    Shard(max_parallelism,
+            workers, total,
+            cost_per_unit, work, recorder);
+  auto cost = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::high_resolution_clock::now() - start_time).count();
+  times++;
+  all_cost += cost;
+  if(times % 100 == 0) {
+    LOG(INFO) << recorder << " " << all_cost << " " << times << " " << recorder->GetCost();
+    all_cost = 0;
+  }
+}
+
+CostRecorder::CostRecorder(int64 default_cost)
+  : record_cost_(default_cost), eigen_pool_param_(1.0) {
+    stage_ = kStageWait;
+    cost_vec_.resize(stage_times_);
+}
+
+void CostRecorder::StageWait(const int64& cost) {
+  // avoid unstable operation during initialization
+  if(record_times_ < stage_times_) {
+    record_times_++;
+    return;
+  }
+  record_times_ = 0;
+  stage_ = kStageInit;
+}
+
+void CostRecorder::StageInit(const int64& cost) {
+  // wait for a while and initialize record_cost_
+  if(record_times_ < stage_times_) {
+    cost_vec_[record_times_] = cost;
+    record_times_++;
+    return;
+  }
+  std::sort(cost_vec_.begin(), cost_vec_.end());
+  int64 sum_cost = 0, num_cost = 0;
+  for(auto pre_cost: cost_vec_) {
+    if(pre_cost < 10 * cost_vec_[0]){
+      sum_cost += pre_cost;
+      num_cost++;
+    }
+  }
+  record_cost_ = sum_cost / num_cost;
+	cost_vec_.clear();
+	cost_vec_.shrink_to_fit();
+  stage_ = kStageWork;
+}
+
+void CostRecorder::StageWork(const int64& cost) {
+  // dynamic recording unit cost
+  if (cost > 10 * record_cost_) return;
+  record_cost_ = 0.9 * record_cost_ + 0.1 * cost;
+}
+
+void CostRecorder::Stage(const int64& cost) {
+  switch (stage_) {
+    case StageType::kStageWork: {
+      StageWork(cost);
+      break;
+    }
+    case StageType::kStageInit: {
+      StageInit(cost);
+      break;
+    }
+    case StageType::kStageWait: {
+      StageWait(cost);
+      break;
+    }
+    default: break;
+  }
+}
+
+void CostRecorder::SetStart() {
+  start_time_ = clock::now();
+}
+
+int64 CostRecorder::GetCost() {
+  return record_cost_;
+}
+
+int64 CostRecorder::GetEigenPoolCost() {
+  return record_cost_ * eigen_pool_param_;
+}
+
+void CostRecorder::UnitUpdate(const int& unit_num) {
+  // updata strategy
+  auto real_cost = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            clock::now() - start_time_).count() / std::max(unit_num, 1);
+  Stage(real_cost);
+}
+
+void CostRecorder::SetPoolParam(const double& param) {
+  eigen_pool_param_ = param;
 }
 
 }  // end namespace tensorflow
