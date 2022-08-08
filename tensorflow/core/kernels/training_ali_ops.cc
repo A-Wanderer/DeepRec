@@ -1967,6 +1967,7 @@ class KvSparseApplyAdamAsyncOp : public OpKernel {
   explicit KvSparseApplyAdamAsyncOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("apply_sparse_rmsprop", &apply_sparse_rmsprop_));
+    record_.SetPoolParam(2.0);
   }
 
   void Compute(OpKernelContext* ctx) override NO_THREAD_SAFETY_ANALYSIS {
@@ -2067,6 +2068,7 @@ class KvSparseApplyAdamAsyncOp : public OpKernel {
             &beta2_scalar, &beta1_scalar, &epsilon_scalar, &lr_scalar, &global_step]
                 (int64 start_i, int64 limit_i) {
           Tstep gs = global_step.scalar<Tstep>()();
+          if(start_i == 0) record_.SetStart();
           for (int64 i = start_i; i < limit_i; i++) {
             const Tindex index = indices_vec(i);
             ValuePtr<T>* value_ptr = nullptr;
@@ -2089,10 +2091,11 @@ class KvSparseApplyAdamAsyncOp : public OpKernel {
               var->Commit(index, value_ptr);
             }
           }
+          if(start_i == 0) record_.UnitUpdate(limit_i - start_i);
         };
         const int64 cost = 1000;
         auto worker_threads = *(ctx->device()->tensorflow_cpu_worker_threads());
-        Shard(worker_threads.num_threads, worker_threads.workers, N, cost, do_work);
+        Shard(worker_threads.num_threads, worker_threads.workers, N, cost, do_work, &record_);
       } else {
         auto beta1_power_scalar = beta1_power.scalar<T>();
         auto beta2_power_scalar = beta2_power.scalar<T>();
@@ -2116,6 +2119,7 @@ class KvSparseApplyAdamAsyncOp : public OpKernel {
             auto indices_vec = indices.vec<Tindex>();
             Tstep gs = global_step.scalar<Tstep>()();
 
+            if(start_i == 0) record_.SetStart();
             for (int64 i = start_i; i < limit_i; i++) {
               const Tindex index = indices_vec(i);
               ValuePtr<T>* value_ptr = nullptr;
@@ -2134,12 +2138,13 @@ class KvSparseApplyAdamAsyncOp : public OpKernel {
                 var->Commit(index, value_ptr);
               }
             }
+            if(start_i == 0) record_.UnitUpdate(limit_i - start_i);
           }
         };
 
         const int64 cost = 1000;
         auto worker_threads = *(ctx->device()->tensorflow_cpu_worker_threads());
-        Shard(worker_threads.num_threads, worker_threads.workers, N, cost, do_work);
+        Shard(worker_threads.num_threads, worker_threads.workers, N, cost, do_work, &record_);
 
         beta1_power_scalar() *= beta1_scalar;
         beta2_power_scalar() *= beta2_scalar;
@@ -2152,6 +2157,7 @@ class KvSparseApplyAdamAsyncOp : public OpKernel {
  private:
   bool use_exclusive_lock_;
   bool apply_sparse_rmsprop_;
+  CostRecorder record_;
 };
 
 #define REGISTER_KERNELS(D, T, Tindices, Tstep)                             \

@@ -17,11 +17,47 @@ limitations under the License.
 #define TENSORFLOW_CORE_UTIL_WORK_SHARDER_H_
 
 #include <functional>
+#include <chrono>
 
 #include "tensorflow/core/lib/core/threadpool.h"
 #include "tensorflow/core/platform/types.h"
 
 namespace tensorflow {
+
+// CostRecorder is a dynamic recording unit_cost tool, you can browse 
+//    https://alidocs.dingtalk.com/i/team/3ZxX8vB73j7RBG7d/docs/3ZxX8aAgJ3O1nm7d
+// for design documents
+class CostRecorder {
+ public:
+  using clock = std::chrono::high_resolution_clock;
+  explicit CostRecorder(int64 default_cost = 1500);
+  ~CostRecorder() = default;
+
+  void SetStart();
+  void UnitUpdate(const int& unit_num = 1);
+  int64 GetCost();
+  int64 GetEigenPoolCost();
+  void SetPoolParam(const double&);
+ private:
+  // Stage function
+  enum StageType {
+    kStageWait = 1,
+    kStageInit = 2,
+    kStageWork = 3,
+  };
+  void StageWait(const int64&);
+  void StageInit(const int64&);
+  void StageWork(const int64&);
+  void Stage(const int64&);
+  StageType stage_;
+
+  const int stage_times_ = 20;
+  clock::time_point start_time_;
+  int64 record_cost_;
+  int64 record_times_;
+  double eigen_pool_param_;
+  std::vector<int> cost_vec_;
+};
 
 // DEPRECATED: Prefer threadpool->TransformRangeConcurrently, which allows you
 // to directly specify the shard size. Use this function only if you want to
@@ -43,6 +79,10 @@ namespace tensorflow {
 // "work" should be a callable taking (int64, int64) arguments.
 // work(start, limit) computes the work units from [start,
 // limit), i.e., [start, limit) is a shard.
+// 
+// "recorder" is used to dynamic recording unit cost. if it is not nullptr, Shard function
+// will use it to get cost by "GetCost" or "GetEigenPoolCost"; otherwise the "cost_per_unit"
+// will be used as cost.
 //
 // Too much parallelism can also cause excessive thread switches,
 // therefore, Shard() often limits the maximum parallelism. Each
@@ -55,7 +95,7 @@ namespace tensorflow {
 // REQUIRES: total >= 0
 // REQUIRES: cost_per_unit >= 0
 void Shard(int max_parallelism, thread::ThreadPool* workers, int64 total,
-           int64 cost_per_unit, std::function<void(int64, int64)> work);
+           int64 cost_per_unit, std::function<void(int64, int64)> work, CostRecorder* recorder = nullptr);
 
 // Each thread has an associated option to express the desired maximum
 // parallelism. Its default is a very large quantity.
