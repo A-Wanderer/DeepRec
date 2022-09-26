@@ -302,10 +302,15 @@ class DLRM_DCN():
 
 # generate dataset pipline
 def build_model_input(filename, batch_size, num_epochs):
-    def parse(value):
-        for col in CONTINUOUS_COLUMNS:
-            value[col] = tf.to_float(value[col])
-        all_columns = value
+    def parse_csv(value):
+        tf.logging.info('Parsing {}'.format(filename))
+        cont_defaults = [[0.0] for i in range(1, 14)]
+        cate_defaults = [[' '] for i in range(1, 27)]
+        label_defaults = [[0]]
+        column_headers = TRAIN_DATA_COLUMNS
+        record_defaults = label_defaults + cont_defaults + cate_defaults
+        columns = tf.io.decode_csv(value, record_defaults=record_defaults)
+        all_columns = collections.OrderedDict(zip(column_headers, columns))
         labels = all_columns.pop(LABEL_COLUMN[0])
         features = all_columns
         return features, labels
@@ -320,16 +325,14 @@ def build_model_input(filename, batch_size, num_epochs):
     else:
         files = filename
 
-    from tensorflow.python.data.experimental.ops import parquet_dataset_ops
-    from tensorflow.python.util import nest    
     # Extract lines from input files using the Dataset API.
-    dataset = parquet_dataset_ops.ParquetDataset([files] * num_epochs, batch_size=batch_size)
-    dataset = dataset.map(parse, num_parallel_calls=28)
+    dataset = tf.data.TextLineDataset(files)
+    dataset = dataset.shuffle(buffer_size=20000,
+                              seed=args.seed)  # set seed for reproducing
+    dataset = dataset.repeat(num_epochs)
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.map(parse_csv, num_parallel_calls=28)
     dataset = dataset.prefetch(2)
-    setattr(dataset, 'output_types', nest.map_structure(
-                lambda spec: spec._to_legacy_output_types(), dataset.element_spec))
-    setattr(dataset, 'output_shapes', nest.map_structure(
-                lambda spec: spec._to_legacy_output_shapes(), dataset.element_spec))
     return dataset
 
 
@@ -537,8 +540,6 @@ def main(tf_config=None, server=None):
     print("Saving model checkpoints to " + checkpoint_dir)
 
     # create data pipline of train & test dataset
-    train_file= args.data_location + '/train.parquet'
-    test_file= args.data_location + '/eval.parquet'
     train_dataset = build_model_input(train_file, batch_size, no_of_epochs)
     test_dataset = build_model_input(test_file, batch_size, 1)
 
@@ -816,7 +817,6 @@ def set_env_for_DeepRec():
     '''
     os.environ['START_STATISTIC_STEP'] = '100'
     os.environ['STOP_STATISTIC_STEP'] = '110'
-    os.environ['ARROW_NUM_THREADS'] = '2'
     os.environ['MALLOC_CONF'] = \
         'background_thread:true,metadata_thp:auto,dirty_decay_ms:20000,muzzy_decay_ms:20000'
 
