@@ -1460,6 +1460,13 @@ REGISTER_OP("SparseSegmentMean")
     .Attr("Tsegmentids: {int32,int64} = DT_INT32")
     .SetShapeFn(SparseSegmentReductionShapeFn);
 
+REGISTER_OP("SparseSegmentMeanWithoutUnique")
+    .Input("data: T")
+    .Input("segment_ids: int32")
+    .Output("output: T")
+    .Attr("T: {float, double}")
+    .SetShapeFn(SparseSegmentReductionWithoutUniqueShapeFn);
+
 REGISTER_OP("SparseSegmentMeanWithNumSegments")
     .Input("data: T")
     .Input("indices: Tidx")

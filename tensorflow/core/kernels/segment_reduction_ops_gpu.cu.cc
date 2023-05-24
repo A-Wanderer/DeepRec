@@ -1200,7 +1200,7 @@ class SparseSegmentMeanWithoutUniqueGpuOp
  public:
   explicit SparseSegmentMeanWithoutUniqueGpuOp(OpKernelConstruction* context)
       : SparseSegmentReductionWithoutUniqueGpuOpBase<T>(
-            context, false /*is_mean*/, false /*is_sqrtn*/,
+            context, true /*is_mean*/, false /*is_sqrtn*/,
             false /* has_num_segments */, T(0) /* default_value */) {}
 };
 
