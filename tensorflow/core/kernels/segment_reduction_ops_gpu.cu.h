@@ -125,6 +125,16 @@ struct SparseSegmentReduceFunctor {
                   const bool is_sqrtn);
 };
 
+template <typename T>
+struct SparseSegmentReduceWithoutUniqueFunctor {
+  void operator()(OpKernelContext* ctx,
+                  const Tensor* input,
+                  const Tensor* seg_ids,
+                  Tensor* output,
+                  const bool is_mean,
+                  const bool is_sqrtn);
+};
+
 template <typename T, typename Index>
 struct SparseSegmentReduceGradFunctor {
   void operator()(OpKernelContext* ctx,

@@ -1252,6 +1252,23 @@ Status SparseSegmentReductionShapeFn(InferenceContext* c) {
   return Status::OK();
 }
 
+Status SparseSegmentReductionWithoutUniqueShapeFn(InferenceContext* c) {
+  ShapeHandle data_shape;
+  TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), 1, &data_shape));
+
+  ShapeHandle segment_ids_shape;
+  TF_RETURN_IF_ERROR(c->WithRank(c->input(1), 1, &segment_ids_shape));
+
+  ShapeHandle subshape;
+  TF_RETURN_IF_ERROR(c->Subshape(data_shape, 1, &subshape));
+
+  ShapeHandle out;
+  TF_RETURN_IF_ERROR(
+      c->Concatenate(c->Vector(InferenceContext::kUnknownDim), subshape, &out));
+  c->set_output(0, out);
+  return Status::OK();
+}
+
 Status SparseSegmentReductionGradShapeFn(InferenceContext* c) {
   ShapeHandle data_shape;
   TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), 1, &data_shape));
@@ -1527,6 +1544,13 @@ REGISTER_OP("SparseSegmentMean")
     .Attr("T: {float, double}")
     .Attr("Tidx: {int32, int64} = DT_INT32")
     .SetShapeFn(SparseSegmentReductionShapeFn);
+
+REGISTER_OP("SparseSegmentMeanWithoutUnique")
+    .Input("data: T")
+    .Input("segment_ids: int32")
+    .Output("output: T")
+    .Attr("T: {float, double}")
+    .SetShapeFn(SparseSegmentReductionWithoutUniqueShapeFn);
 
 REGISTER_OP("SparseSegmentMeanWithNumSegments")
     .Input("data: T")

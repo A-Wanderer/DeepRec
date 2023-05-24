@@ -665,6 +665,29 @@ __global__ void SparseSegmentSumKernel(const int64 data_sparse_size,
     functor::AtomicSumOpGpu()(output + output_idx, ldg(data + data_idx));
   }
 }
+
+template <typename T, typename Index>
+__global__ void SparseSegmentSumWithoutUniqueKernel(const int64 data_sparse_size,
+                                       const int64 output_total_size,
+                                       const int64 data_inner_dim,
+                                       const T* data,
+                                       const int32* seg_ids,
+                                       T* output) {
+
+  for (int input_index : GpuGridRangeX(data_sparse_size)) {
+    const Index sparse_row = input_index / data_inner_dim;
+    const Index sparse_offset = input_index % data_inner_dim;
+    const Index data_row = sparse_row;
+    const Index data_idx = data_row * data_inner_dim + sparse_offset;
+    const Index output_row = seg_ids[sparse_row];
+    const Index output_idx = output_row * data_inner_dim + sparse_offset;
+    if (output_idx < 0 || output_idx >= output_total_size) {
+      continue;
+    }
+    functor::AtomicSumOpGpu()(output + output_idx, ldg(data + data_idx));
+  }
+}
+
 template <typename T, typename Index>
 __global__ void SparseSegmentGradKernel(const int64 data_sparse_size,
                                         const int64 output_total_size,
@@ -804,6 +827,77 @@ void SparseSegmentReduceFunctor<T, Index>::operator()(OpKernelContext* ctx,
   }
 }
 
+template <typename T>
+void SparseSegmentReduceWithoutUniqueFunctor<T>::operator()(OpKernelContext* ctx,
+                                                      const Tensor* input,
+                                                      const Tensor* seg_ids,
+                                                      Tensor* output,
+                                                      const bool is_mean,
+                                                      const bool is_sqrtn) {
+  const int64 num_ids = seg_ids->NumElements();
+  if (input->NumElements() == 0 || num_ids == 0) {
+    return;
+  }
+
+  Tensor seg_lens;
+  const auto data_flat = input->flat_outer_dims<T>();
+  const auto segment_flat = seg_ids->flat<int32>();
+  auto output_flat = output->flat<T>();
+
+  const int64 data_inner_dim = data_flat.dimension(1);
+  const int64 data_sparse_size = num_ids * data_inner_dim;
+  const int64 output_total_size = output->NumElements();
+  const int64 output_row_size = output_total_size/data_inner_dim;
+
+  const GPUDevice d = ctx->eigen_device<GPUDevice>();
+
+  // initialize output by default value
+  GpuLaunchConfig config = GetGpuLaunchConfig(output_total_size, d);
+  SetToValue<<<config.block_count, config.thread_per_block,
+      0, d.stream()>>>(static_cast<int>(output_total_size),
+      output_flat.data(), T(0.0));
+
+  config = GetGpuLaunchConfig(data_sparse_size, d);
+  // launch a kernel
+  SparseSegmentSumWithoutUniqueKernel<T, int32>
+      <<<config.block_count, config.thread_per_block, 0, d.stream()>>>(
+          data_sparse_size, output_total_size, data_inner_dim, data_flat.data(),
+          segment_flat.data(), output_flat.data());
+
+  if (is_mean | is_sqrtn) {
+    OP_REQUIRES_OK(ctx, ctx->allocate_temp(output->dtype(),
+                        TensorShape({output_row_size}),
+                   &seg_lens));
+    auto segment_lens_flat = seg_lens.flat<T>();
+    config = GetGpuLaunchConfig(output_row_size, d);
+    SetZero<T><<<config.block_count, config.thread_per_block,
+      0, d.stream()>>>(static_cast<int>(output_row_size),
+      segment_lens_flat.data());
+    // launch a kernel to sum the seg_lens for each segment
+    config = GetGpuLaunchConfig(num_ids, d);
+    SparseSegmentLenSumKernel<T, int32>
+      <<<config.block_count, config.thread_per_block, 0, d.stream()>>>(
+          num_ids, output_row_size, segment_flat.data(),
+          segment_lens_flat.data());
+  }
+  // for mean
+  if (is_mean) {
+    auto segment_lens_flat = seg_lens.flat<T>();
+    config = GetGpuLaunchConfig(output_total_size, d);
+    SparseSegmentMeanKernel<T, int32>
+      <<<config.block_count, config.thread_per_block, 0, d.stream()>>>
+      (output_total_size, data_inner_dim, output_flat.data(),
+       segment_lens_flat.data());
+  } else if (is_sqrtn) {
+    auto segment_lens_flat = seg_lens.flat<T>();
+    config = GetGpuLaunchConfig(output_total_size, d);
+    SparseSegmentSqrtNKernel<T, int32>
+      <<<config.block_count, config.thread_per_block, 0, d.stream()>>>
+      (output_total_size, data_inner_dim, output_flat.data(),
+       segment_lens_flat.data());
+  }
+}
+
 template <typename T, typename Index>
 void SparseSegmentReduceGradFunctor<T, Index>::operator()(OpKernelContext* ctx,
                                                           const Tensor* input,
@@ -869,11 +963,15 @@ void SparseSegmentReduceGradFunctor<T, Index>::operator()(OpKernelContext* ctx,
 #define DEFINE_SPARSE_GPU_SPEC_SET_VAL(T) \
   template struct SetValueDefault<T>;
 
+#define DEFINE_SPARSE_GPU_SPEC_REDUCE_WITHOUT_UNIQUE(T) \
+  template struct SparseSegmentReduceWithoutUniqueFunctor<T>
+
 #define DEFINE_SPARSE_GPU_SPEC(T)         \
   DEFINE_SPARSE_GPU_SPEC_REDUCE(T, int32); \
   DEFINE_SPARSE_GPU_SPEC_GRAD_REDUCE(T, int32); \
   DEFINE_SPARSE_GPU_SPEC_REDUCE(T, int64); \
-  DEFINE_SPARSE_GPU_SPEC_GRAD_REDUCE(T, int64);
+  DEFINE_SPARSE_GPU_SPEC_GRAD_REDUCE(T, int64); \
+  DEFINE_SPARSE_GPU_SPEC_REDUCE_WITHOUT_UNIQUE(T);
 
 TF_CALL_float(DEFINE_SPARSE_GPU_SPEC)
 TF_CALL_double(DEFINE_SPARSE_GPU_SPEC)
@@ -1014,6 +1112,99 @@ class SparseSegmentReductionGpuOpBase : public OpKernel {
   const T default_value_;
 };
 
+
+template <class T>
+class SparseSegmentReductionWithoutUniqueGpuOpBase : public OpKernel {
+ public:
+  explicit SparseSegmentReductionWithoutUniqueGpuOpBase(OpKernelConstruction* context,
+                                           bool is_mean, bool is_sqrtn,
+                                           bool has_num_segments,
+                                           T default_value)
+      : OpKernel(context),
+        is_mean_(is_mean),
+        is_sqrtn_(is_sqrtn),
+        has_num_segments_(has_num_segments),
+        default_value_(default_value) {}
+
+  void Compute(OpKernelContext* context) override {
+    const Tensor& input = context->input(0);
+    const Tensor& segment_ids = context->input(1);
+
+    int32 output_rows = -1;
+    if (has_num_segments_) {
+      const Tensor& num_segments = context->input(2);
+      OP_REQUIRES(
+          context, num_segments.shape().dims() == 0,
+          errors::InvalidArgument("num_segments should be a scalar, not shape ",
+                                  num_segments.shape().DebugString()));
+      output_rows = internal::SubtleMustCopy(num_segments.scalar<int32>()());
+      OP_REQUIRES(context, output_rows >= 0,
+                  errors::InvalidArgument("segment ids must be >= 0"));
+    }
+
+    OP_REQUIRES(context, TensorShapeUtils::IsVector(segment_ids.shape()),
+                errors::InvalidArgument("segment_ids should be a vector."));
+
+    if (segment_ids.NumElements() == 0) {
+      TensorShape output_shape = input.shape();
+      functor::SetValueDefault<T> setval_functor_;
+      output_shape.set_dim(0, output_rows < 0 ? 0: output_rows);
+      Tensor* output = nullptr;
+      OP_REQUIRES_OK(context, context->allocate_output(
+        0, output_shape, &output));
+      if (output_rows > 0) {
+        setval_functor_(context, output, default_value_);
+      }
+      return;
+    }
+
+    typedef int32 OutputRow;
+    const auto segment_vec = segment_ids.vec<OutputRow>();
+    int32 max_id = 0;
+    functor::FindMaxSegId<OutputRow> find_max_seg_functor_;
+    find_max_seg_functor_(context, &segment_ids, max_id);
+
+    const OutputRow last_segment_id_plus_one = max_id + 1;
+
+    if (has_num_segments_) {
+      OP_REQUIRES(
+          context, output_rows >= last_segment_id_plus_one,
+          errors::InvalidArgument("segment ids must be < num_segments"));
+    } else {
+      output_rows = last_segment_id_plus_one;
+    }
+    OP_REQUIRES(context, output_rows >= 0,
+                errors::InvalidArgument("segment ids must be >= 0"));
+
+    TensorShape output_shape = input.shape();
+    output_shape.set_dim(0, output_rows);
+
+    Tensor* output = nullptr;
+    OP_REQUIRES_OK(context, context->allocate_output(0, output_shape, &output));
+    // set default value to output
+    functor::SparseSegmentReduceWithoutUniqueFunctor<T> reduction_functor_;
+    reduction_functor_(context, &input,
+                       &segment_ids, output, is_mean_, is_sqrtn_);
+  }
+
+ private:
+  const bool is_mean_;
+  const bool is_sqrtn_;
+  const bool has_num_segments_;
+  const T default_value_;
+};
+
+template <class T>
+class SparseSegmentMeanWithoutUniqueGpuOp
+    : public SparseSegmentReductionWithoutUniqueGpuOpBase<T> {
+ public:
+  explicit SparseSegmentMeanWithoutUniqueGpuOp(OpKernelConstruction* context)
+      : SparseSegmentReductionWithoutUniqueGpuOpBase<T>(
+            context, false /*is_mean*/, false /*is_sqrtn*/,
+            false /* has_num_segments */, T(0) /* default_value */) {}
+};
+
+
 template <class T, typename Index>
 class SparseSegmentReductionSumGpuOp
     : public SparseSegmentReductionGpuOpBase<T, Index> {
@@ -1117,6 +1308,16 @@ REGISTER_GPU_SPARSE_KERNELS(float, int32)
 REGISTER_GPU_SPARSE_KERNELS(double, int32)
 REGISTER_GPU_SPARSE_KERNELS(double, int64)
 #undef REGISTER_GPU_SPARSE_KERNELS
+
+#define REGISTER_GPU_SPARSE_WITHOUT_UNIQUE_KERNELS(type)               \
+  REGISTER_KERNEL_BUILDER(Name("SparseSegmentMeanWithoutUnique")                   \
+                              .Device(DEVICE_GPU)                                  \
+                              .TypeConstraint<type>("T"),                           \
+                          SparseSegmentMeanWithoutUniqueGpuOp<type>);  \
+
+REGISTER_GPU_SPARSE_WITHOUT_UNIQUE_KERNELS(float)
+REGISTER_GPU_SPARSE_WITHOUT_UNIQUE_KERNELS(double)
+#undef REGISTER_GPU_SPARSE_WITHOUT_UNIQUE_KERNELS
 
 template <class T, typename Index>
 class SparseSegmentGradGpuOpBase : public OpKernel {
